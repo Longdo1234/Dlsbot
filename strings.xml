@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DLS Bot</string>
+    <string name="a11y_desc">Cho phép DLS Bot thực hiện thao tác chạm và vuốt thay bạn trong game.</string>
+</resources>
