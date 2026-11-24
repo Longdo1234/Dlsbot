@@ -46,6 +46,11 @@ const val T_SHOOT_BOX = 120L   // A ~20% trong vòng cấm
 const val T_SHOOT_GK = 650L    // B 100% khi đối mặt thủ môn
 const val T_SHOOT_FAR = 300L   // A ~50% sút xa
 const val T_SWITCH_C = 70L     // C: đổi sang hậu vệ
+const val FOE_SPEED = 7f       // tốc độ chạy tối đa ước lượng của hậu vệ (m/s)
+const val SEG = 80L            // độ dài mỗi đoạn gesture nối tiếp (ms): ngắn hơn = phản xạ nhanh hơn
+val RAD15 = 15f * PIF / 180f
+val RAD25 = 25f * PIF / 180f
+val RAD80 = 80f * PIF / 180f
 
 class P(val x: Float, val y: Float) // toạ độ mét trên sân (x: 0..105, y: 0..68)
 
@@ -197,9 +202,9 @@ object RadarAnalyzer {
 
 // ======================= ĐA CHẠM LIÊN TỤC (GesturePump) =======================
 /**
- * Mỗi "ngón tay ảo" là một Track. Mọi nét được gửi chung trong từng gesture ngắn (30-120ms)
+ * Mỗi "ngón tay ảo" là một Track. Mọi nét được gửi chung trong từng gesture ngắn (SEG ms)
  * và nối tiếp bằng continueStroke(willContinue = true), nên joystick không bao giờ bị nhấc lên,
- * còn các nút A/B/C và vuốt được thêm vào cùng gesture mà không làm đứt joystick.
+ * còn các nút A/B/C/L và vuốt được thêm vào cùng gesture mà không làm đứt joystick.
  * (Gửi gesture riêng lẻ sẽ khiến Android HỦY gesture đang chạy, nên phải gộp như vậy.)
  */
 class Track {
@@ -215,9 +220,11 @@ class Track {
 
 class Pump(private val svc: AccessibilityService) {
     private val lock = Any()
-    private val names = listOf("joy", "A", "B", "C", "swipe")
+    private val names = listOf("joy", "A", "B", "C", "L", "swipe")
     private val tr: Map<String, Track> = names.associateWith { Track() }
-    private val btnKeys = mapOf("A" to ("ax" to "ay"), "B" to ("bx" to "by"), "C" to ("cx" to "cy"))
+    private val btnKeys = mapOf(
+        "A" to ("ax" to "ay"), "B" to ("bx" to "by"), "C" to ("cx" to "cy"), "L" to ("lx" to "ly")
+    )
     @Volatile private var alive = false
     @Volatile private var sw = 0
     @Volatile private var sh = 0
@@ -245,12 +252,12 @@ class Pump(private val svc: AccessibilityService) {
     /** Giữ joystick tại góc angle (rad). Gọi lại liên tục để làm mới; tự nhả sau hold ms nếu ngừng gọi. */
     fun joy(angle: Float, hold: Long = 500L) {
         val t = tr.getValue("joy")
-        val cfgR = Cfg.get(svc, "jr") * sh
+        val r = Cfg.get(svc, "jr") * sh
         synchronized(lock) {
             t.sx = Cfg.get(svc, "jx") * sw
             t.sy = Cfg.get(svc, "jy") * sh
-            t.tx = t.sx + cos(angle) * cfgR
-            t.ty = t.sy + sin(angle) * cfgR
+            t.tx = t.sx + cos(angle) * r
+            t.ty = t.sy + sin(angle) * r
             t.until = System.currentTimeMillis() + hold
         }
     }
@@ -294,7 +301,7 @@ class Pump(private val svc: AccessibilityService) {
         val out = ArrayList<GestureDescription.StrokeDescription>()
         synchronized(lock) {
             val now = System.currentTimeMillis()
-            var seg = 120L
+            var seg = SEG
             for ((k, t) in tr) {
                 if (k != "joy" && t.until > now) {
                     val rem = t.until - now
@@ -369,7 +376,7 @@ class Pump(private val svc: AccessibilityService) {
         while (alive) {
             val s = build()
             if (s.isEmpty()) {
-                Thread.sleep(15)
+                Thread.sleep(10)
                 continue
             }
             dispatch(s)
@@ -383,6 +390,9 @@ class Pump(private val svc: AccessibilityService) {
 }
 
 // ======================= CHIẾN THUẬT =======================
+class PassOpt(val mate: P, val lob: Boolean, val score: Float, val dist: Float)
+class ShotPlan(val btn: String, val ms: Long, val t0: Long)
+
 class Tactics(private val c: Context, private val pump: Pump) {
     var state = "-"
     var goalX = PL
@@ -395,38 +405,69 @@ class Tactics(private val c: Context, private val pump: Pump) {
     private var lastShot = 0L
     private var lastOneTwo = 0L
     private var lastSwitch = 0L
-    private var svx = 1f
-    private var svy = 0f
+    private var lastPass = 0L
+    private var lastCross = 0L
+    private var heading = 0f
+    private var headingInit = false
+    private var lastHT = 0L
+    private var runOff = 0f
+    private var evadeUntil = 0L
+    private var evadeAng = 0f
     private var ballPrev: P? = null
     private var ballPrevT = 0L
     private var bvx = 0f
     private var bvy = 0f
+    private var carrPrev: P? = null
+    private var carrPrevT = 0L
+    private var cvx = 0f
+    private var cvy = 0f
+    private var lastR: Radar? = null
+    private var shotPlan: ShotPlan? = null
 
     fun reset() {
         sched.clear()
         busyUntil = 0L
         state = "-"
         carrier = null
+        shotPlan = null
+        headingInit = false
+        evadeUntil = 0L
     }
 
     private fun at(delay: Long, now: Long, f: () -> Unit) {
         sched.add(Pair(now + delay, f))
     }
 
-    private fun steer(a: Float) {
-        svx = 0.55f * svx + 0.45f * cos(a)
-        svy = 0.55f * svy + 0.45f * sin(a)
-        pump.joy(atan2(svy, svx))
-    }
-
+    // ---------- Điều khiển joystick mượt ----------
+    /** Xoay tức thì (dùng khi ngắm chuyền/sút). */
     private fun aimNow(a: Float, hold: Long = 500L) {
-        svx = cos(a)
-        svy = sin(a)
+        heading = a
+        headingInit = true
         pump.joy(a, hold)
     }
 
     /**
-     * Thủ môn đội mình (áo đỏ) đứng sát biên khung thành nhà -> tấn công về phía ngược lại.
+     * Rê bóng mượt: có vùng chết (không đổi hướng khi lệch nhỏ) và giới hạn tốc độ xoay,
+     * chỉ xoay nhanh (fast = true) khi cần ngoặt né hậu vệ.
+     */
+    private fun driveTo(desired: Float, now: Long, fast: Boolean) {
+        if (!headingInit) {
+            heading = desired
+            headingInit = true
+        }
+        val dt = (now - lastHT).coerceIn(1L, 100L) / 1000f
+        lastHT = now
+        val diff = wrap(desired - heading)
+        val dead = Cfg.get(c, "dead") * PIF / 180f
+        if (fast || abs(diff) > dead) {
+            val rate = (if (fast) Cfg.get(c, "evade") else Cfg.get(c, "turn")) * PIF / 180f * dt
+            heading = wrap(heading + diff.coerceIn(-rate, rate))
+        }
+        pump.joy(heading)
+    }
+
+    /**
+     * Thủ môn đội mình đứng sát biên khung thành nhà -> tấn công về phía ngược lại.
      * Thủ môn đối phương = chấm đối thủ gần khung thành cần ghi nhất.
      */
     private fun detectGoal(r: Radar) {
@@ -437,38 +478,66 @@ class Tactics(private val c: Context, private val pump: Pump) {
             if (a.x < minX) minX = a.x
             if (a.x > maxX) maxX = a.x
         }
-        vote += if (minX < PL - maxX) 1 else -1 // thủ môn nhà ở bên trái -> tấn công sang phải
-        vote = vote.coerceIn(-15, 15)
-        if (vote >= 8) attackRight = true
-        if (vote <= -8) attackRight = false
+        vote += if (minX < PL - maxX) 1 else -1
+        vote = vote.coerceIn(-30, 30)
+        if (vote >= 20) attackRight = true
+        if (vote <= -20) attackRight = false
         goalX = if (attackRight) PL else 0f
         enemyGk = r.enemies.filter { abs(it.x - goalX) < 12f }.minByOrNull { abs(it.x - goalX) }
     }
 
+    // ---------- Lực theo khoảng cách ----------
+    private fun clampMs(v: Float, lo: Float, hi: Float): Long = min(max(v, lo), max(lo, hi)).toLong()
+
+    private fun passMs(d: Float): Long =
+        clampMs(Cfg.get(c, "passBase") + Cfg.get(c, "passPerM") * d, 80f, Cfg.get(c, "passMax"))
+
+    private fun lobMs(d: Float): Long =
+        clampMs(Cfg.get(c, "lobBase") + Cfg.get(c, "lobPerM") * d, 80f, Cfg.get(c, "lobMax"))
+
+    /** Sút A: gần gôn nhẹ (tránh vọt xà), xa ngoài vòng cấm mạnh hơn. */
+    private fun shotMs(d: Float): Long {
+        val t = ((d - 8f) / 20f).coerceIn(0f, 1f)
+        val n = Cfg.get(c, "shotNear")
+        val f = Cfg.get(c, "shotFar")
+        return (n + t * (f - n)).toLong()
+    }
+
+    /** Sút sệt (đè B): càng xa càng giữ lâu. */
+    private fun groundShotMs(d: Float): Long {
+        val base = Cfg.get(c, "gsBase")
+        return clampMs(base + Cfg.get(c, "gsPerM") * (d - 6f), base, Cfg.get(c, "gsMax"))
+    }
+
+    // ---------- Vòng lặp quyết định ----------
     fun update(r: Radar, now: Long) {
         val due = sched.filter { it.first <= now }
         if (due.isNotEmpty()) {
             sched.removeAll(due.toSet())
             for (d in due) d.second()
         }
-        detectGoal(r)
+        val fresh = r !== lastR
+        lastR = r
+        if (fresh) detectGoal(r)
         val ball = r.ball
         if (ball == null) {
             carrier = null
             state = "NO_BALL"
+            shotPlan = null
             return
         }
-        // vận tốc bóng (làm mượt)
-        val pb = ballPrev
-        if (pb == null) {
-            ballPrev = ball
-            ballPrevT = now
-        } else if (now - ballPrevT >= 150) {
-            val dt = (now - ballPrevT) / 1000f
-            bvx = 0.5f * bvx + 0.5f * (ball.x - pb.x) / dt
-            bvy = 0.5f * bvy + 0.5f * (ball.y - pb.y) / dt
-            ballPrev = ball
-            ballPrevT = now
+        if (fresh) {
+            val pb = ballPrev
+            if (pb == null) {
+                ballPrev = ball
+                ballPrevT = now
+            } else if (now - ballPrevT >= 150) {
+                val dt = (now - ballPrevT) / 1000f
+                bvx = 0.5f * bvx + 0.5f * (ball.x - pb.x) / dt
+                bvy = 0.5f * bvy + 0.5f * (ball.y - pb.y) / dt
+                ballPrev = ball
+                ballPrevT = now
+            }
         }
         val carryM = Cfg.get(c, "carryFrac") * PL
         var carr: P? = null
@@ -480,126 +549,174 @@ class Tactics(private val c: Context, private val pump: Pump) {
                 carr = a
             }
         }
-        carrier = carr
+        val cr = carr
+        carrier = cr
+        if (fresh) {
+            if (cr != null) {
+                val cp = carrPrev
+                if (cp == null) {
+                    carrPrev = cr
+                    carrPrevT = now
+                } else if (now - carrPrevT >= 200) {
+                    val dt = (now - carrPrevT) / 1000f
+                    cvx = 0.5f * cvx + 0.5f * (cr.x - cp.x) / dt
+                    cvy = 0.5f * cvy + 0.5f * (cr.y - cp.y) / dt
+                    carrPrev = cr
+                    carrPrevT = now
+                }
+            } else {
+                carrPrev = null
+                cvx = 0f
+                cvy = 0f
+            }
+        }
         val enemyNear = r.enemies.minByOrNull { dist(it, ball) }
         val ownGoalX = if (attackRight) 0f else PL
         val ownSign = if (attackRight) -1f else 1f
         state = when {
-            carr != null -> "ATTACK"
+            cr != null -> "ATTACK"
             enemyNear != null && dist(enemyNear, ball) < carryM * 1.5f -> "DEFEND"
             abs(ball.x - ownGoalX) < PL / 2f || bvx * ownSign > 2f -> "DEFEND"
             else -> "LOOSE"
         }
+        if (state != "ATTACK") shotPlan = null
+        if (shotPlan != null && cr != null) {
+            if (tickShot(r, cr, now)) return
+        }
         if (now < busyUntil) return
         if (state != "DEFEND") pump.release("B")
         when (state) {
-            "ATTACK" -> attack(r, carr!!, now)
+            "ATTACK" -> attack(r, cr!!, now)
             "DEFEND" -> defend(r, ball, enemyNear, now)
-            else -> chase(r, ball)
+            else -> chase(r, ball, now)
         }
     }
 
+    // ---------- Hình học & kiểm tra đường chuyền ----------
     private fun laneFree(r: Radar, a: P, b: P, rad: Float): Boolean =
         r.enemies.none { it !== enemyGk && segDist(it, a, b) < rad }
 
-    private fun isOpen(r: Radar, p: P, rad: Float): Boolean =
-        r.enemies.none { dist(it, p) < rad }
-
-    private fun forwardAlly(r: Radar, me: P, dirSign: Float): P? =
-        r.allies.filter {
-            it !== me && (it.x - me.x) * dirSign >= 3f && dist(it, me) in 8f..38f &&
-                isOpen(r, it, 5f) && laneFree(r, me, it, 2.5f)
-        }.maxByOrNull { (it.x - me.x) * dirSign - 0.3f * dist(it, me) }
-
-    private fun supportAlly(r: Radar, me: P): P? =
-        r.allies.filter {
-            it !== me && dist(it, me) in 6f..30f && isOpen(r, it, 5f) && laneFree(r, me, it, 2.5f)
-        }.minByOrNull { dist(it, me) }
-
-    // ---------- KHI CÓ BÓNG ----------
-    private fun attack(r: Radar, me: P, now: Long) {
-        val dirSign = if (attackRight) 1f else -1f
-        val goal = P(goalX, PW / 2f)
-        val dGoal = dist(me, goal)
-        val axis = if (attackRight) 0f else PIF
-        val narrow = abs(wrap(ang(me, goal) - axis)) > RAD75
-        val danger = Cfg.get(c, "danger")
-        val nearest = r.enemies.minByOrNull { dist(it, me) }
-        val pressed = nearest != null && dist(nearest, me) < danger
-        val inBox = abs(me.x - goalX) <= 16.5f && abs(me.y - PW / 2f) <= 20.15f
-
-        // 1) Dứt điểm 3 cấp độ (cấm sút khi góc quá hẹp > 75 độ)
-        if (dGoal <= 25f && now - lastShot > 2500) {
-            val clear = laneFree(r, me, goal, 2.2f)
-            if (!narrow && (inBox || clear)) {
-                val gkY = enemyGk?.y ?: (PW / 2f)
-                val aimY = if (gkY > PW / 2f) PW / 2f - 3.2f else PW / 2f + 3.2f
-                val a = ang(me, P(goalX, aimY))
-                val shot: Pair<String, Long>? = when {
-                    dGoal <= 14f && clear -> Pair("B", T_SHOOT_GK)
-                    dGoal <= 16.5f -> Pair("A", T_SHOOT_BOX)
-                    clear -> Pair("A", T_SHOOT_FAR)
-                    else -> null
-                }
-                if (shot != null) {
-                    shoot(a, shot.first, shot.second, now)
-                    return
-                }
-            }
+    /** Bóng bay với tốc độ bs (m/s): có hậu vệ nào chạy tới chặn kịp không. */
+    private fun intercepted(r: Radar, a: P, b: P, bs: Float): Boolean {
+        val dx = b.x - a.x
+        val dy = b.y - a.y
+        val l2 = dx * dx + dy * dy
+        if (l2 < 1e-4f) return false
+        val len = sqrt(l2)
+        for (f in r.enemies) {
+            if (f === enemyGk) continue
+            val t = (((f.x - a.x) * dx + (f.y - a.y) * dy) / l2).coerceIn(0f, 1f)
+            val qx = a.x + t * dx
+            val qy = a.y + t * dy
+            val dFoe = hypot(f.x - qx, f.y - qy)
+            if (dFoe < 1.6f) return true
+            if (dFoe / FOE_SPEED < (t * len) / bs + 0.25f) return true
         }
-        // góc quá hẹp: ưu tiên chuyền ngược cho tuyến hai
-        if (narrow && dGoal <= 25f) {
-            val sup = supportAlly(r, me)
-            if (sup != null) {
-                passTo(sup, me, now)
-                return
-            }
-        }
-        // 2) Ban bật dọc biên
-        val onWing = me.y < PW * 0.25f || me.y > PW * 0.75f
-        if (onWing && !inBox && dGoal > 20f && now - lastOneTwo > 5000) {
-            val mate = r.allies.filter {
-                it !== me && dist(it, me) in 6f..25f && isOpen(r, it, 4f) &&
-                    (it.x - me.x) * dirSign >= -3f && laneFree(r, me, it, 2.2f)
-            }.minByOrNull { dist(it, me) }
-            if (mate != null) {
-                oneTwo(me, mate, now)
-                return
-            }
-        }
-        // 3) Bị áp sát: chỉ chuyền cho đồng đội phía trên, không bị kèm
-        if (pressed) {
-            val tgt = forwardAlly(r, me, dirSign)
-            if (tgt != null) {
-                passTo(tgt, me, now)
-                return
-            }
-        }
-        // 4) Rê bóng về phía khung thành, né đối thủ
-        var vx = cos(ang(me, goal))
-        var vy = sin(ang(me, goal))
-        for (e in r.enemies) {
-            val d = dist(e, me)
-            if (d < 9f && d > 0.1f) {
-                val w = (9f - d) / 9f * 1.3f
-                vx += (me.x - e.x) / d * w
-                vy += (me.y - e.y) / d * w
-            }
-        }
-        steer(atan2(vy, vx))
+        return false
     }
 
-    private fun passTo(t: P, me: P, now: Long) {
-        aimNow(ang(me, t), 600L)
-        busyUntil = now + T_AIM_PASS + T_PASS_B + 120
-        at(T_AIM_PASS, now) { pump.press("B", T_PASS_B) }
+    /** Điểm ngắm trong khung thành: ưu tiên phía xa thủ môn (vùng trống). */
+    private fun aimPoint(me: P): P {
+        val mid = PW / 2f
+        val gk = enemyGk
+        val y = when {
+            gk == null -> if (me.y < mid) mid + 2.4f else mid - 2.4f
+            gk.y > mid -> mid - 2.8f
+            else -> mid + 2.8f
+        }
+        return P(goalX, y)
     }
 
-    private fun shoot(a: Float, btn: String, ms: Long, now: Long) {
-        aimNow(a, 700L)
-        lastShot = now
-        busyUntil = now + T_AIM_SHOOT + ms + 200
-        at(T_AIM_SHOOT, now) { pump.press(btn, ms) }
+    private fun rayScore(r: Radar, me: P, a: Float, goalAng: Float): Float {
+        val ex = me.x + cos(a) * 14f
+        val ey = me.y + sin(a) * 14f
+        val end = P(ex, ey)
+        var s = cos(wrap(a - goalAng))
+        for (f in r.enemies) {
+            val d = segDist(f, me, end)
+            if (d < 5f) s -= (5f - d) / 5f * 1.6f
+        }
+        if (ex < -1f || ex > PL + 1f || ey < 1f || ey > PW - 1f) s -= 0.8f
+        return s
+    }
+
+    /** Chọn hướng chạy vào khoảng trống; chỉ đổi khi tốt hơn rõ rệt (chống zigzag). */
+    private fun chooseRun(r: Radar, me: P, goalAng: Float): Float {
+        var bestOff = runOff
+        var bs = -9f
+        for (k in -4..4) {
+            val off = k * RAD15
+            val s = rayScore(r, me, goalAng + off, goalAng) + (if (abs(off - runOff) < 0.01f) 0.25f else 0f)
+            if (s > bs) {
+                bs = s
+                bestOff = off
+            }
+        }
+        val curS = rayScore(r, me, goalAng + runOff, goalAng) + 0.25f
+        if (bs > curS + 0.2f) runOff = bestOff
+        return wrap(goalAng + runOff)
+    }
+
+    /** Chọn đồng đội nhận bóng tốt nhất: đường chuyền thoáng, không bị kèm, vị trí thuận lợi. */
+    private fun bestPass(
+        r: Radar, me: P, dirSign: Float, minFwd: Float, allowLob: Boolean, dMin: Float, dMax: Float
+    ): PassOpt? {
+        var best: PassOpt? = null
+        for (m in r.allies) {
+            if (m === me) continue
+            val d = dist(me, m)
+            if (d < dMin || d > dMax) continue
+            val fwd = (m.x - me.x) * dirSign
+            if (fwd < minFwd) continue
+            var space = 30f
+            for (e in r.enemies) space = min(space, dist(e, m))
+            if (space < 4.5f) continue
+            if (abs(m.x - goalX) < 3f && abs(m.y - PW / 2f) > 12f) continue
+            val ground = !intercepted(r, me, m, 22f)
+            val lobOk = allowLob && d >= 12f && space >= 5.5f
+            if (!ground && !lobOk) continue
+            val lobbing = !ground
+            val s = fwd + min(space, 12f) * 0.8f - d * 0.12f - (if (lobbing) 2f else 0f)
+            val cur = best
+            if (cur == null || s > cur.score) best = PassOpt(m, lobbing, s, d)
+        }
+        return best
+    }
+
+    private fun doPass(o: PassOpt, me: P, now: Long) {
+        val btn = if (o.lob) "L" else "B"
+        val ms = if (o.lob) lobMs(o.dist) else passMs(o.dist)
+        aimNow(ang(me, o.mate), 700L)
+        busyUntil = now + T_AIM_PASS + ms + 140
+        lastPass = now
+        at(T_AIM_PASS, now) { pump.press(btn, ms) }
+    }
+
+    /** Tạt cánh: đứng sát biên ngang gần vòng cấm và có đồng đội thoáng trong vòng cấm. */
+    private fun tryCross(r: Radar, me: P, now: Long): Boolean {
+        val side = min(me.y, PW - me.y)
+        val gx = abs(me.x - goalX)
+        if (side > 14f || gx > 32f || gx < 10f) return false
+        var best: P? = null
+        var bs = -99f
+        for (m in r.allies) {
+            if (m === me) continue
+            if (abs(m.x - goalX) > 18f || abs(m.y - PW / 2f) > 16f) continue
+            var space = 30f
+            for (e in r.enemies) space = min(space, dist(e, m))
+            if (space < 3.5f) continue
+            val s = min(space, 10f) - abs(m.y - PW / 2f) * 0.25f
+            if (s > bs) {
+                bs = s
+                best = m
+            }
+        }
+        val t = best ?: return false
+        val d = dist(me, t)
+        if (d < 8f) return false
+        doPass(PassOpt(t, true, bs, d), me, now)
+        lastCross = now
+        return true
     }
 
     private fun oneTwo(me: P, mate: P, now: Long) {
@@ -617,15 +734,133 @@ class Tactics(private val c: Context, private val pump: Pump) {
         }
     }
 
+    /** Ngắm trước, chỉ bấm sút khi người chơi đã hướng mặt đúng vùng trống (không sút khi đang xoay). */
+    private fun tickShot(r: Radar, me: P, now: Long): Boolean {
+        val sp = shotPlan ?: return false
+        val goal = P(goalX, PW / 2f)
+        val axis = if (attackRight) 0f else PIF
+        if (abs(wrap(ang(me, goal) - axis)) > RAD75) {
+            shotPlan = null
+            return false
+        }
+        val aim = ang(me, aimPoint(me))
+        aimNow(aim, 700L)
+        val waited = now - sp.t0
+        val spd = hypot(cvx, cvy)
+        val facing = if (spd > 2.5f) abs(wrap(atan2(cvy, cvx) - aim)) else 0f
+        if (waited >= T_AIM_SHOOT && facing < RAD25) {
+            pump.press(sp.btn, sp.ms)
+            lastShot = now
+            busyUntil = now + sp.ms + 220
+            shotPlan = null
+            return true
+        }
+        if (waited > 650) {
+            shotPlan = null
+            return false
+        }
+        return true
+    }
+
+    // ---------- KHI CÓ BÓNG ----------
+    private fun attack(r: Radar, me: P, now: Long) {
+        val dirSign = if (attackRight) 1f else -1f
+        val goal = P(goalX, PW / 2f)
+        val dGoal = dist(me, goal)
+        val axis = if (attackRight) 0f else PIF
+        val narrow = abs(wrap(ang(me, goal) - axis)) > RAD75
+        val danger = Cfg.get(c, "danger")
+        val nearest = r.enemies.minByOrNull { dist(it, me) }
+        val pressed = nearest != null && dist(nearest, me) < danger
+        val inBox = abs(me.x - goalX) <= 16.5f && abs(me.y - PW / 2f) <= 20.15f
+
+        // 1) Dứt điểm: ngắm vùng trống -> chờ hướng mặt -> bấm. Gần/trung bình & thoáng: sút sệt (đè B).
+        if (now - lastShot > 2200 && dGoal <= 28f && !narrow) {
+            val ap = aimPoint(me)
+            val clear = laneFree(r, me, ap, 2.2f)
+            if (clear || (inBox && dGoal <= 16.5f)) {
+                val btn = if (dGoal <= 22f && clear) "B" else "A"
+                val ms = if (btn == "B") groundShotMs(dGoal) else shotMs(dGoal)
+                shotPlan = ShotPlan(btn, ms, now)
+                aimNow(ang(me, ap), 700L)
+                return
+            }
+        }
+        // 2) Góc quá hẹp: chuyền ngược an toàn cho tuyến hai
+        if (narrow && dGoal <= 25f && now - lastPass > 1000) {
+            val o = bestPass(r, me, dirSign, -25f, false, 6f, 30f)
+            if (o != null) {
+                doPass(o, me, now)
+                return
+            }
+        }
+        // 3) Tạt cánh
+        if (now - lastCross > 3000 && tryCross(r, me, now)) return
+        // 4) Ban bật dọc biên (đồng đội phải thoáng, đường chuyền không bị cắt)
+        val onWing = me.y < PW * 0.25f || me.y > PW * 0.75f
+        if (onWing && !inBox && dGoal > 20f && now - lastOneTwo > 5000) {
+            val o = bestPass(r, me, dirSign, -3f, false, 6f, 25f)
+            if (o != null) {
+                oneTwo(me, o.mate, now)
+                return
+            }
+        }
+        // 5) Bị áp sát hoặc bị chắn đường: chỉ chuyền khi có người nhận thuận lợi (sệt, hoặc bổng nếu sệt bị chặn)
+        if (now - lastPass > 1200) {
+            val goalAng = ang(me, goal)
+            val ahead = r.enemies.any { dist(it, me) < 10f && abs(wrap(ang(me, it) - goalAng)) < RAD25 }
+            if (pressed || ahead) {
+                val o = bestPass(r, me, dirSign, if (pressed) -2f else 3f, true, 8f, 38f)
+                if (o != null && o.score > (if (pressed) 0f else 6f)) {
+                    doPass(o, me, now)
+                    return
+                }
+            }
+        }
+        // 6) Rê bóng
+        dribble(r, me, goal, now)
+    }
+
+    private fun dribble(r: Radar, me: P, goal: P, now: Long) {
+        val danger = Cfg.get(c, "danger")
+        val goalAng = ang(me, goal)
+        if (now < evadeUntil) {
+            driveTo(evadeAng, now, true)
+            return
+        }
+        // Chỉ ngoặt né khi có hậu vệ áp sát phía trước trong bán kính nguy hiểm
+        var threat: P? = null
+        var td = danger
+        for (e in r.enemies) {
+            val d = dist(e, me)
+            if (d < td && abs(wrap(ang(me, e) - heading)) < RAD80) {
+                td = d
+                threat = e
+            }
+        }
+        val th = threat
+        if (th != null) {
+            val base = ang(me, th)
+            val a1 = wrap(base + PIF / 2f)
+            val a2 = wrap(base - PIF / 2f)
+            val pick = if (rayScore(r, me, a1, goalAng) >= rayScore(r, me, a2, goalAng)) a1 else a2
+            evadeAng = wrap(pick + 0.25f * wrap(goalAng - pick))
+            evadeUntil = now + 500L // giữ hướng né, không đổi qua lại
+            driveTo(evadeAng, now, true)
+            return
+        }
+        // Không bị áp sát: chạy thẳng vào khoảng trống
+        driveTo(chooseRun(r, me, goalAng), now, false)
+    }
+
     // ---------- KHI KHÔNG CÓ BÓNG ----------
     private fun defend(r: Radar, ball: P, enemyBall: P?, now: Long) {
         pump.press("B", 500L) // đè B áp sát, KHÔNG bao giờ bấm A (tránh xoạc, thẻ đỏ)
         val me = r.allies.minByOrNull { dist(it, ball) } ?: return
         val tgt = enemyBall ?: ball
-        val lead = 0.45f
-        val ix = tgt.x + bvx * lead
-        val iy = tgt.y + bvy * lead
-        steer(atan2(iy - me.y, ix - me.x))
+        val ix = tgt.x + bvx * 0.45f
+        val iy = tgt.y + bvy * 0.45f
+        driveTo(atan2(iy - me.y, ix - me.x), now, false)
         val ownSign = if (attackRight) -1f else 1f
         if ((ball.x - me.x) * ownSign > 8f && now - lastSwitch > 1500) {
             pump.press("C", T_SWITCH_C) // bóng đã vượt qua: đổi sang hậu vệ tuyến dưới
@@ -633,9 +868,9 @@ class Tactics(private val c: Context, private val pump: Pump) {
         }
     }
 
-    private fun chase(r: Radar, ball: P) {
+    private fun chase(r: Radar, ball: P, now: Long) {
         val me = r.allies.minByOrNull { dist(it, ball) } ?: return
-        steer(ang(me, ball))
+        driveTo(ang(me, ball), now, false)
     }
 }
 
@@ -662,10 +897,19 @@ class BotService : AccessibilityService() {
     private var tactics: Tactics? = null
     private var templates: List<Template> = emptyList()
     private var matchMode = false
-    private var lastRadar: Radar? = null
+    @Volatile private var radar: Radar? = null
+    @Volatile private var radarRoi: Roi? = null
+    @Volatile private var radarT = 0L
+    @Volatile private var radarCount = 0
+    private var okStreak = 0
+    private var lastSeenT = 0L
     private var lastRadarOk = 0L
     private var lastMenuCheck = 0L
+    private var lastSizeCheck = 0L
     private var lastDbg = 0L
+    private var lastFpsT = 0L
+    private var lastFpsCount = 0
+    private var fps = 0
 
     override fun onServiceConnected() {
         instance = this
@@ -702,6 +946,7 @@ class BotService : AccessibilityService() {
     private fun btn(t: String, a: () -> Unit): Button {
         val b = Button(this)
         b.text = t
+        b.isAllCaps = false
         b.setOnClickListener { a() }
         return b
     }
@@ -817,7 +1062,7 @@ class BotService : AccessibilityService() {
         pt.textSize = 22f
         cv.drawText(
             tac.state + "  ta=" + rd.allies.size + " dich=" + rd.enemies.size +
-                " goal=" + (if (tac.goalX > 50f) "PHAI" else "TRAI"),
+                " goal=" + (if (tac.goalX > 50f) "PHAI" else "TRAI") + " fps=" + fps,
             6f, 24f, pt
         )
         ui.post { dbgView?.setImageBitmap(out) }
@@ -827,21 +1072,20 @@ class BotService : AccessibilityService() {
     private fun openEditor() {
         val cap = CaptureService.instance
         if (cap == null) {
-            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Bật quét màn hình'")
+            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Quét màn hình'")
             return
         }
         if (editor != null) return
         if (running) stopBot()
+        cap.wantFull = true
+        cap.forceFull = true
         panel?.visibility = View.INVISIBLE
+        ui.postDelayed({ cap.forceFull = true }, 300)
         ui.postDelayed({
-            Thread {
-                val bmp = cap.grab()
-                ui.post {
-                    panel?.visibility = View.VISIBLE
-                    if (bmp == null) toast("Không chụp được màn hình") else showEditor(bmp)
-                }
-            }.start()
-        }, 450)
+            val bmp = cap.grab()
+            panel?.visibility = View.VISIBLE
+            if (bmp == null) toast("Không chụp được màn hình") else showEditor(bmp)
+        }, 750)
     }
 
     private fun showEditor(bmp: Bitmap) {
@@ -910,6 +1154,7 @@ class BotService : AccessibilityService() {
         row1.addView(btn("A") { setPos("ax", "ay", false) })
         row1.addView(btn("B") { setPos("bx", "by", false) })
         row1.addView(btn("C") { setPos("cx", "cy", false) })
+        row1.addView(btn("L") { setPos("lx", "ly", false) })
         row1.addView(btn("Vuốt") { setPos("wx", "wy", false) })
         val row2 = LinearLayout(this)
         row2.orientation = LinearLayout.HORIZONTAL
@@ -936,20 +1181,32 @@ class BotService : AccessibilityService() {
     // ---------- Chạy / dừng ----------
     private fun startBot() {
         if (running) return
-        if (CaptureService.instance == null) {
-            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Bật quét màn hình'")
+        val cap = CaptureService.instance
+        if (cap == null) {
+            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Quét màn hình'")
             return
         }
         running = true
         runBtn?.text = "■"
         templates = Store.load(this)
+        radar = null
+        radarRoi = null
+        radarCount = 0
+        okStreak = 0
+        lastSeenT = 0L
+        matchMode = false
+        // Luồng "cap": cắt vùng RADAR và phân tích ngay khi có khung hình mới
+        cap.roiSpec = floatArrayOf(
+            Cfg.get(this, "mmL"), Cfg.get(this, "mmT"), Cfg.get(this, "mmR"), Cfg.get(this, "mmB")
+        )
+        cap.wantFull = true
+        cap.onRoi = { roi -> handleRoi(roi) }
         val p = Pump(this)
         pump = p
         p.start()
         tactics = Tactics(this, p)
-        matchMode = false
-        lastRadar = null
-        val t = HandlerThread("radar")
+        // Luồng "brain": ra quyết định ~60 lần/giây trên khung radar mới nhất
+        val t = HandlerThread("brain")
         t.start()
         ht = t
         val hd = Handler(t.looper)
@@ -961,6 +1218,11 @@ class BotService : AccessibilityService() {
     private fun stopBot() {
         running = false
         runBtn?.text = "▶"
+        CaptureService.instance?.let {
+            it.onRoi = null
+            it.roiSpec = null
+            it.wantFull = true
+        }
         handler?.removeCallbacksAndMessages(null)
         ht?.quitSafely()
         ht = null
@@ -968,6 +1230,14 @@ class BotService : AccessibilityService() {
         pump?.stopAndRelease()
         pump = null
         tactics = null
+    }
+
+    private fun handleRoi(roi: Roi) {
+        val rd = RadarAnalyzer.analyze(this, roi.px, roi.w, roi.h)
+        radarRoi = roi
+        radar = rd
+        radarT = System.currentTimeMillis()
+        radarCount++
     }
 
     private val tick = object : Runnable {
@@ -979,24 +1249,8 @@ class BotService : AccessibilityService() {
             } catch (e: Exception) {
             }
             val dt = System.currentTimeMillis() - t0
-            handler?.postDelayed(this, max(5L, 55L - dt)) // ~15-18 FPS
+            handler?.postDelayed(this, max(2L, 16L - dt))
         }
-    }
-
-    private fun roiOf(bmp: Bitmap): Roi {
-        val l = Cfg.get(this, "mmL")
-        val t = Cfg.get(this, "mmT")
-        val r = Cfg.get(this, "mmR")
-        val b = Cfg.get(this, "mmB")
-        val x0 = (min(l, r) * bmp.width).toInt().coerceIn(0, bmp.width - 2)
-        val x1 = (max(l, r) * bmp.width).toInt().coerceIn(x0 + 1, bmp.width)
-        val y0 = (min(t, b) * bmp.height).toInt().coerceIn(0, bmp.height - 2)
-        val y1 = (max(t, b) * bmp.height).toInt().coerceIn(y0 + 1, bmp.height)
-        val rw = x1 - x0
-        val rh = y1 - y0
-        val px = IntArray(rw * rh)
-        bmp.getPixels(px, 0, rw, x0, y0, rw, rh)
-        return Roi(px, rw, rh, true)
     }
 
     private fun step() {
@@ -1004,26 +1258,32 @@ class BotService : AccessibilityService() {
         val p = pump ?: return
         val tac = tactics ?: return
         val now = System.currentTimeMillis()
+        if (now - lastSizeCheck > 500) {
+            lastSizeCheck = now
+            cap.checkSize()
+        }
+        if (now - lastFpsT >= 1000) {
+            val c = radarCount
+            fps = c - lastFpsCount
+            lastFpsCount = c
+            lastFpsT = now
+        }
         p.setScreen(cap.w, cap.h)
+        val rd = radar
+        if (dbgOn && now - lastDbg > 200 && rd != null) {
+            lastDbg = now
+            radarRoi?.let { drawDebug(it, rd, tac) }
+        }
         if (matchMode) {
-            val roi = cap.grabRoi(
-                Cfg.get(this, "mmL"), Cfg.get(this, "mmT"), Cfg.get(this, "mmR"), Cfg.get(this, "mmB")
-            ) ?: return
-            if (roi.fresh || lastRadar == null) {
-                val rd0 = RadarAnalyzer.analyze(this, roi.px, roi.w, roi.h)
-                lastRadar = rd0
-                if (dbgOn && now - lastDbg > 200) {
-                    lastDbg = now
-                    drawDebug(roi, rd0, tac)
-                }
-            }
-            val rd = lastRadar ?: return
-            if (rd.ok) lastRadarOk = now
+            if (rd == null) return
+            if (rd.ok && now - radarT < 600) lastRadarOk = now
             if (now - lastRadarOk > 2500) {
                 matchMode = false
+                cap.wantFull = true
+                cap.last = null
                 tac.reset()
                 p.stopAll()
-                lastRadar = null
+                radar = null
                 toast("Ra khỏi trận, quay lại chế độ menu")
                 return
             }
@@ -1033,19 +1293,23 @@ class BotService : AccessibilityService() {
             }
             tac.update(rd, now)
         } else {
+            // vào trận khi radar hợp lệ qua nhiều khung hình liên tiếp
+            if (rd != null && rd.ok && radarT != lastSeenT && now - radarT < 500) {
+                lastSeenT = radarT
+                okStreak++
+                if (okStreak >= 10) {
+                    matchMode = true
+                    cap.wantFull = false // vào trận: không cần khung đầy đủ nữa -> nhẹ hơn
+                    lastRadarOk = now
+                    okStreak = 0
+                    toast("Đã vào trận - bot điều khiển")
+                }
+                return
+            }
+            if (rd == null || !rd.ok) okStreak = 0
             if (now - lastMenuCheck < 700) return
             lastMenuCheck = now
             val bmp = cap.grab() ?: return
-            val roi = roiOf(bmp)
-            val rd = RadarAnalyzer.analyze(this, roi.px, roi.w, roi.h)
-            if (dbgOn) drawDebug(roi, rd, tac)
-            if (rd.ok) {
-                matchMode = true
-                lastRadar = rd
-                lastRadarOk = now
-                toast("Đã vào trận - bot điều khiển")
-                return
-            }
             menuStep(bmp, p)
         }
     }

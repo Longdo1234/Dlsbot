@@ -15,6 +15,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -22,12 +23,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.util.DisplayMetrics
 import android.view.Display
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
@@ -42,43 +45,67 @@ import kotlin.math.max
 import kotlin.math.min
 
 // ======================= CẤU HÌNH (sửa được trong app) =======================
-class Field(val key: String, val label: String, val def: Float)
+class Field(val key: String, val short: String, val def: Float)
+class Row(val label: String, val keys: List<String>)
+class Tab(val title: String, val rows: List<Row>)
 
 object Cfg {
     val FIELDS = listOf(
-        // Vùng RADAR (minimap) - tỉ lệ 0..1 so với màn hình ngang. Nên đặt bằng nút RADAR trong 📷
-        Field("mmL", "RADAR trái (MINIMAP_LEFT)", 0.36f),
-        Field("mmT", "RADAR trên (MINIMAP_TOP)", 0.80f),
-        Field("mmR", "RADAR phải (MINIMAP_RIGHT)", 0.64f),
-        Field("mmB", "RADAR dưới (MINIMAP_BOTTOM)", 0.98f),
-        // Joystick
-        Field("jx", "Joystick X (JOY_X)", 0.14f),
-        Field("jy", "Joystick Y (JOY_Y)", 0.72f),
-        Field("jr", "Bán kính kéo (JOY_RADIUS, theo chiều cao)", 0.10f),
-        // Nút hành động
-        Field("ax", "Nút A - X", 0.88f),
-        Field("ay", "Nút A - Y", 0.70f),
-        Field("bx", "Nút B - X", 0.80f),
-        Field("by", "Nút B - Y", 0.82f),
-        Field("cx", "Nút C - X", 0.93f),
-        Field("cy", "Nút C - Y", 0.55f),
-        Field("wx", "Điểm bắt đầu vuốt - X", 0.75f),
-        Field("wy", "Điểm bắt đầu vuốt - Y", 0.40f),
-        Field("wlen", "Độ dài vuốt (theo chiều rộng)", 0.10f),
-        // Màu trên radar (hue 0-360)
-        Field("allyHue", "Màu đội mình - hue (0 = đỏ)", 0f),
-        Field("allyTol", "Dung sai hue đội mình", 30f),
-        Field("enemyHue", "Màu đối thủ - hue (-1 = TỰ ĐỘNG: mọi màu khác đội mình)", -1f),
-        Field("enemyTol", "Dung sai hue đối thủ (chỉ dùng khi không để -1)", 35f),
-        Field("pitchHue", "Màu nền sân trên radar - hue (120 = xanh lá)", 120f),
-        Field("pitchTol", "Dung sai hue nền sân (bị bỏ qua)", 55f),
-        Field("minSat", "Độ bão hòa tối thiểu (0-1)", 0.45f),
-        Field("minVal", "Độ sáng tối thiểu (0-1)", 0.35f),
+        // Radar (tỉ lệ 0..1 so với màn hình ngang). Nên đặt bằng nút RADAR trong 📷
+        Field("mmL", "Trái", 0.36f), Field("mmT", "Trên", 0.80f),
+        Field("mmR", "Phải", 0.64f), Field("mmB", "Dưới", 0.98f),
+        // Vị trí các nút
+        Field("jx", "X", 0.14f), Field("jy", "Y", 0.72f), Field("jr", "Bán kính", 0.10f),
+        Field("ax", "X", 0.88f), Field("ay", "Y", 0.70f),
+        Field("bx", "X", 0.80f), Field("by", "Y", 0.82f),
+        Field("cx", "X", 0.93f), Field("cy", "Y", 0.55f),
+        Field("lx", "X", 0.95f), Field("ly", "Y", 0.80f),
+        Field("wx", "X", 0.75f), Field("wy", "Y", 0.40f), Field("wlen", "Dài", 0.10f),
+        // Màu radar
+        Field("allyHue", "Hue", 0f), Field("allyTol", "Sai số ±", 30f),
+        Field("enemyHue", "Hue (-1 = tự động)", -1f), Field("enemyTol", "Sai số ±", 35f),
+        Field("pitchHue", "Hue", 120f), Field("pitchTol", "Sai số ±", 55f),
+        Field("minSat", "Bão hòa ≥", 0.45f), Field("minVal", "Sáng ≥", 0.35f),
         // Chiến thuật
-        Field("carryFrac", "Ngưỡng giữ bóng (tỉ lệ chiều rộng radar)", 0.02f),
-        Field("danger", "Bán kính nguy hiểm khi bị áp sát (mét)", 7f),
-        Field("dir", "Hướng tấn công ban đầu (1 = phải, -1 = trái)", 1f),
-        Field("thresh", "Ngưỡng nhận diện nút menu (nhỏ = chặt)", 14f)
+        Field("carryFrac", "Giữ bóng", 0.02f), Field("danger", "Nguy hiểm (m)", 7f),
+        Field("dir", "1 = phải", 1f),
+        Field("dead", "Vùng chết °", 12f), Field("turn", "Xoay °/s", 200f), Field("evade", "Né °/s", 600f),
+        Field("thresh", "Ngưỡng", 14f),
+        // Lực (ms giữ phím)
+        Field("passBase", "Nền ms", 100f), Field("passPerM", "ms mỗi m", 9.5f), Field("passMax", "Tối đa", 560f),
+        Field("lobBase", "Nền ms", 110f), Field("lobPerM", "ms mỗi m", 8.5f), Field("lobMax", "Tối đa", 520f),
+        Field("shotNear", "Gần ms", 110f), Field("shotFar", "Xa ms", 340f),
+        Field("gsBase", "Nền ms", 300f), Field("gsPerM", "ms mỗi m", 14f), Field("gsMax", "Tối đa", 650f)
+    )
+
+    val TABS = listOf(
+        Tab("Nút", listOf(
+            Row("Joystick", listOf("jx", "jy", "jr")),
+            Row("A (sút)", listOf("ax", "ay")),
+            Row("B (chuyền)", listOf("bx", "by")),
+            Row("C (đổi người)", listOf("cx", "cy")),
+            Row("L (bổng/tạt)", listOf("lx", "ly")),
+            Row("Vuốt", listOf("wx", "wy", "wlen"))
+        )),
+        Tab("Radar", listOf(
+            Row("Vùng radar", listOf("mmL", "mmT", "mmR", "mmB")),
+            Row("Đội mình", listOf("allyHue", "allyTol")),
+            Row("Đối thủ", listOf("enemyHue", "enemyTol")),
+            Row("Nền sân", listOf("pitchHue", "pitchTol")),
+            Row("Ngưỡng màu", listOf("minSat", "minVal"))
+        )),
+        Tab("Chiến thuật", listOf(
+            Row("Bóng / áp sát", listOf("carryFrac", "danger")),
+            Row("Hướng tấn công", listOf("dir")),
+            Row("Rê bóng", listOf("dead", "turn", "evade")),
+            Row("Nút menu", listOf("thresh"))
+        )),
+        Tab("Lực", listOf(
+            Row("Chuyền sệt B", listOf("passBase", "passPerM", "passMax")),
+            Row("Chuyền bổng L", listOf("lobBase", "lobPerM", "lobMax")),
+            Row("Sút A", listOf("shotNear", "shotFar")),
+            Row("Sút sệt B", listOf("gsBase", "gsPerM", "gsMax"))
+        ))
     )
 
     private fun p(c: Context) = c.getSharedPreferences("cfg3", Context.MODE_PRIVATE)
@@ -194,7 +221,11 @@ object Store {
     }
 }
 
-// ======================= QUÉT MÀN HÌNH =======================
+// ======================= QUÉT MÀN HÌNH (đường ống đa luồng) =======================
+/**
+ * ImageReader báo khung hình mới ngay khi có (không hỏi vòng), luồng "cap" cắt đúng vùng RADAR
+ * từ bộ đệm ảnh rồi phân tích tại chỗ. Khung đầy đủ chỉ được tạo khi cần (menu / chụp template).
+ */
 class CaptureService : Service() {
     companion object {
         @Volatile
@@ -204,15 +235,21 @@ class CaptureService : Service() {
     private var mp: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
+    private var thread: HandlerThread? = null
+    private var th: Handler? = null
     var w = 0
         private set
     var h = 0
         private set
     private var dpi = 0
-    private var last: Bitmap? = null
-    private var lastRoi: Roi? = null
-    private var lastRoiKey = ""
     private var released = false
+    private var lastFullT = 0L
+
+    @Volatile var last: Bitmap? = null
+    @Volatile var wantFull = true
+    @Volatile var forceFull = false
+    @Volatile var roiSpec: FloatArray? = null
+    @Volatile var onRoi: ((Roi) -> Unit)? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -248,14 +285,24 @@ class CaptureService : Service() {
                 release()
             }
         }, Handler(Looper.getMainLooper()))
+        val t = HandlerThread("cap")
+        t.start()
+        thread = t
+        th = Handler(t.looper)
         measure()
-        val rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        val rd = newReader()
         reader = rd
         vd = mp?.createVirtualDisplay(
             "dlsbot", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
         )
         instance = this
         return START_NOT_STICKY
+    }
+
+    private fun newReader(): ImageReader {
+        val rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+        rd.setOnImageAvailableListener({ r -> process(r) }, th)
+        return rd
     }
 
     @Suppress("DEPRECATION")
@@ -268,101 +315,94 @@ class CaptureService : Service() {
         dpi = dm.densityDpi
     }
 
-    private fun ensureSize() {
+    /** Gọi định kỳ: nếu xoay màn hình (dọc <-> ngang) thì tạo lại vùng đệm cho đúng kích thước. */
+    @Synchronized
+    fun checkSize() {
         val ow = w
         val oh = h
         measure()
         if (ow != w || oh != h) {
             reader?.close()
-            val rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            val rd = newReader()
             reader = rd
             vd?.resize(w, h, dpi)
             vd?.surface = rd.surface
             last = null
-            lastRoi = null
         }
     }
 
-    /** Khung hình đầy đủ (dùng cho menu và chụp template). */
-    @Synchronized
-    fun grab(): Bitmap? {
-        ensureSize()
-        val img = try {
-            reader?.acquireLatestImage()
-        } catch (e: Exception) {
-            null
-        }
-        if (img != null) {
-            try {
-                val p = img.planes[0]
-                val pad = p.rowStride - p.pixelStride * img.width
-                val tmp = Bitmap.createBitmap(
-                    img.width + pad / p.pixelStride, img.height, Bitmap.Config.ARGB_8888
-                )
-                tmp.copyPixelsFromBuffer(p.buffer)
-                val bmp = Bitmap.createBitmap(tmp, 0, 0, img.width, img.height)
-                if (bmp !== tmp) tmp.recycle()
-                last = bmp
-            } finally {
-                img.close()
-            }
-        }
-        return last
-    }
+    fun grab(): Bitmap? = last
 
-    /** Chỉ đọc vùng RADAR từ bộ đệm ảnh (nhanh, dùng cho vòng lặp 15-20 FPS). */
-    @Synchronized
-    fun grabRoi(f0: Float, f1: Float, f2: Float, f3: Float): Roi? {
-        ensureSize()
-        val key = "$w,$h,$f0,$f1,$f2,$f3"
+    private fun process(rd: ImageReader) {
         val img = try {
-            reader?.acquireLatestImage()
+            rd.acquireLatestImage()
         } catch (e: Exception) {
             null
         }
-        if (img == null) {
-            val lr = lastRoi
-            return if (lr != null && key == lastRoiKey) Roi(lr.px, lr.w, lr.h, false) else null
-        }
+        if (img == null) return
         try {
-            val iw = img.width
-            val ih = img.height
-            val x0 = (min(f0, f2) * iw).toInt().coerceIn(0, iw - 2)
-            val x1 = (max(f0, f2) * iw).toInt().coerceIn(x0 + 1, iw)
-            val y0 = (min(f1, f3) * ih).toInt().coerceIn(0, ih - 2)
-            val y1 = (max(f1, f3) * ih).toInt().coerceIn(y0 + 1, ih)
-            val rw = x1 - x0
-            val rh = y1 - y0
-            val p = img.planes[0]
-            val buf = p.buffer
-            val rs = p.rowStride
-            val ps = p.pixelStride
-            val out = IntArray(rw * rh)
-            for (yy in 0 until rh) {
-                var off = (y0 + yy) * rs + x0 * ps
-                for (xx in 0 until rw) {
-                    val r = buf.get(off).toInt() and 255
-                    val g = buf.get(off + 1).toInt() and 255
-                    val b = buf.get(off + 2).toInt() and 255
-                    out[yy * rw + xx] = (255 shl 24) or (r shl 16) or (g shl 8) or b
-                    off += ps
-                }
+            val spec = roiSpec
+            val cb = onRoi
+            if (spec != null && cb != null) {
+                cb(readRoi(img, spec[0], spec[1], spec[2], spec[3]))
             }
-            val roi = Roi(out, rw, rh, true)
-            lastRoi = roi
-            lastRoiKey = key
-            return roi
+            val now = System.currentTimeMillis()
+            if (wantFull && (forceFull || now - lastFullT >= 250)) {
+                forceFull = false
+                lastFullT = now
+                last = readFull(img)
+            }
+        } catch (e: Exception) {
         } finally {
             img.close()
         }
     }
 
+    private fun readRoi(img: Image, f0: Float, f1: Float, f2: Float, f3: Float): Roi {
+        val iw = img.width
+        val ih = img.height
+        val x0 = (min(f0, f2) * iw).toInt().coerceIn(0, iw - 2)
+        val x1 = (max(f0, f2) * iw).toInt().coerceIn(x0 + 1, iw)
+        val y0 = (min(f1, f3) * ih).toInt().coerceIn(0, ih - 2)
+        val y1 = (max(f1, f3) * ih).toInt().coerceIn(y0 + 1, ih)
+        val rw = x1 - x0
+        val rh = y1 - y0
+        val p = img.planes[0]
+        val buf = p.buffer
+        val rs = p.rowStride
+        val ps = p.pixelStride
+        val out = IntArray(rw * rh)
+        for (yy in 0 until rh) {
+            var off = (y0 + yy) * rs + x0 * ps
+            for (xx in 0 until rw) {
+                val r = buf.get(off).toInt() and 255
+                val g = buf.get(off + 1).toInt() and 255
+                val b = buf.get(off + 2).toInt() and 255
+                out[yy * rw + xx] = (255 shl 24) or (r shl 16) or (g shl 8) or b
+                off += ps
+            }
+        }
+        return Roi(out, rw, rh, true)
+    }
+
+    private fun readFull(img: Image): Bitmap {
+        val p = img.planes[0]
+        val pad = p.rowStride - p.pixelStride * img.width
+        val tmp = Bitmap.createBitmap(img.width + pad / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
+        tmp.copyPixelsFromBuffer(p.buffer)
+        val bmp = Bitmap.createBitmap(tmp, 0, 0, img.width, img.height)
+        if (bmp !== tmp) tmp.recycle()
+        return bmp
+    }
+
     private fun release() {
         if (released) return
         released = true
+        onRoi = null
         try { vd?.release() } catch (e: Exception) { }
         try { reader?.close() } catch (e: Exception) { }
         try { mp?.stop() } catch (e: Exception) { }
+        try { thread?.quitSafely() } catch (e: Exception) { }
         instance = null
         stopSelf()
     }
@@ -408,83 +448,143 @@ class SelectView(c: Context) : View(c) {
     }
 }
 
-// ======================= MÀN HÌNH CHÍNH =======================
+// ======================= MÀN HÌNH CHÍNH: BẢNG CẤU HÌNH GỌN =======================
 class MainActivity : Activity() {
     private lateinit var status: TextView
+    private lateinit var content: LinearLayout
     private val inputs = HashMap<String, EditText>()
+    private var tabIndex = 0
+
+    private fun mkBtn(t: String, a: () -> Unit): Button {
+        val b = Button(this)
+        b.text = t
+        b.textSize = 12f
+        b.isAllCaps = false
+        b.setOnClickListener { a() }
+        return b
+    }
+
+    private fun hrow(vararg v: View): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.HORIZONTAL
+        for (x in v) l.addView(x, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return l
+    }
+
+    private fun toast(m: String) {
+        Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun fmt(v: Float): String =
+        String.format(java.util.Locale.US, "%.3f", v).trimEnd('0').trimEnd('.')
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setPadding(32, 32, 32, 32)
-        val sv = ScrollView(this)
-        sv.addView(root)
-        setContentView(sv)
+        root.setPadding(16, 16, 16, 16)
+        setContentView(root)
 
         status = TextView(this)
-        status.textSize = 16f
+        status.textSize = 13f
         root.addView(status)
 
-        fun add(label: String, a: () -> Unit) {
-            val bt = Button(this)
-            bt.text = label
-            bt.setOnClickListener { a() }
-            root.addView(bt)
-        }
+        root.addView(hrow(
+            mkBtn("1. Trợ năng") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+            mkBtn("2. Quét màn hình") { requestCapture() },
+            mkBtn("Lưu") { saveVisible(); toast("Đã lưu") }
+        ))
+        root.addView(hrow(
+            mkBtn("Thông tin app") {
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                )
+            },
+            mkBtn("Xóa mẫu menu") { Store.clear(this); refresh() }
+        ))
 
-        add("1. Mở cài đặt Trợ năng (bật 'DLS Bot')") {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        val tabs = ArrayList<View>()
+        for ((i, t) in Cfg.TABS.withIndex()) {
+            tabs.add(mkBtn(t.title) { saveVisible(); showTab(i) })
         }
-        add("Nếu bị chặn: mở Thông tin ứng dụng") {
-            startActivity(
-                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
-            )
-        }
-        add("2. Bật quét màn hình") {
-            val m = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            startActivityForResult(m.createScreenCaptureIntent(), 100)
-        }
+        root.addView(hrow(*tabs.toTypedArray()))
 
         val help = TextView(this)
-        help.text = "\n3. Mở DLS (chế độ ngang, đang có trận). Thanh nổi: ≡ kéo, ▶ chạy/dừng, " +
-            "📷 chụp màn hình rồi: kéo vòng quanh RADAR và bấm 'RADAR'; kéo quanh joystick và bấm 'Joystick'; " +
-            "chạm/kéo quanh nút A, B, C, điểm vuốt rồi bấm đúng nút. 'Lưu: NÚT MENU' để dạy bot bấm nút menu. " +
-            "🔍 bật khung kiểm tra radar (vòng cyan = đội mình, vòng đỏ = đối thủ, vòng vàng = bóng), M = chỉ bấm menu.\n\n" +
-            "Các thông số (có thể sửa tay):\n"
+        help.textSize = 11f
+        help.text = "Mở DLS (ngang) → thanh nổi → 📷: kéo chọn vùng rồi bấm RADAR / Joystick / A / B / C / L / Vuốt " +
+            "để đặt vị trí nhanh. 🔍 hiện khung kiểm tra radar. Các ô bên dưới chỉnh tay."
         root.addView(help)
 
-        for (f in Cfg.FIELDS) {
-            val l = TextView(this)
-            l.text = f.label
-            root.addView(l)
-            val e = EditText(this)
-            e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
-                InputType.TYPE_NUMBER_FLAG_SIGNED
-            e.setText(Cfg.get(this, f.key).toString())
-            inputs[f.key] = e
-            root.addView(e)
-        }
-        add("Lưu cấu hình") {
-            for (f in Cfg.FIELDS) {
-                inputs[f.key]?.text?.toString()?.toFloatOrNull()?.let { Cfg.set(this, f.key, it) }
-            }
-            Toast.makeText(this, "Đã lưu cấu hình", Toast.LENGTH_SHORT).show()
-        }
-        add("Cập nhật ô nhập từ giá trị đã đặt bằng 📷") {
-            for (f in Cfg.FIELDS) inputs[f.key]?.setText(Cfg.get(this, f.key).toString())
-        }
-        add("Xóa toàn bộ template menu") {
-            Store.clear(this)
-            refresh()
-        }
+        val sv = ScrollView(this)
+        content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        sv.addView(content)
+        root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        showTab(0)
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
         }
     }
 
+    private fun showTab(i: Int) {
+        tabIndex = i
+        inputs.clear()
+        content.removeAllViews()
+        val tab = Cfg.TABS[i]
+        for (row in tab.rows) {
+            val line = LinearLayout(this)
+            line.orientation = LinearLayout.HORIZONTAL
+            line.gravity = Gravity.CENTER_VERTICAL
+            val lab = TextView(this)
+            lab.text = row.label
+            lab.textSize = 12f
+            line.addView(lab, LinearLayout.LayoutParams(0, -2, 1.2f))
+            for (k in row.keys) {
+                val f = Cfg.FIELDS.first { it.key == k }
+                val cell = LinearLayout(this)
+                cell.orientation = LinearLayout.VERTICAL
+                val cap = TextView(this)
+                cap.text = f.short
+                cap.textSize = 10f
+                cap.gravity = Gravity.CENTER
+                val e = EditText(this)
+                e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
+                    InputType.TYPE_NUMBER_FLAG_SIGNED
+                e.textSize = 13f
+                e.gravity = Gravity.CENTER
+                e.setSingleLine()
+                e.setPadding(4, 8, 4, 8)
+                e.setText(fmt(Cfg.get(this, k)))
+                inputs[k] = e
+                cell.addView(cap, LinearLayout.LayoutParams(-1, -2))
+                cell.addView(e, LinearLayout.LayoutParams(-1, -2))
+                line.addView(cell, LinearLayout.LayoutParams(0, -2, 1f))
+            }
+            content.addView(line)
+        }
+    }
+
+    private fun saveVisible() {
+        for ((k, e) in inputs) {
+            val v = e.text.toString().trim().replace(',', '.').toFloatOrNull()
+            if (v != null) Cfg.set(this, k, v)
+        }
+    }
+
+    private fun requestCapture() {
+        val m = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(m.createScreenCaptureIntent(), 100)
+    }
+
+    override fun onPause() {
+        saveVisible()
+        super.onPause()
+    }
+
     override fun onResume() {
         super.onResume()
+        showTab(tabIndex) // nạp lại các giá trị vừa đặt bằng 📷
         refresh()
     }
 
@@ -505,8 +605,8 @@ class MainActivity : Activity() {
             contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: "").contains(packageName)
         val cap = CaptureService.instance != null
-        status.text = "Trợ năng: " + (if (enabled) "ĐÃ BẬT ✅" else "chưa bật ❌") +
-            "\nQuét màn hình: " + (if (cap) "ĐANG CHẠY ✅" else "chưa bật ❌") +
-            "\nTemplate menu đã lưu: " + Store.count(this)
+        status.text = "Trợ năng: " + (if (enabled) "BẬT ✅" else "chưa bật ❌") +
+            "   |   Quét màn hình: " + (if (cap) "CHẠY ✅" else "chưa bật ❌") +
+            "   |   Mẫu menu: " + Store.count(this)
     }
 }
