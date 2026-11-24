@@ -66,10 +66,12 @@ object Cfg {
         Field("wy", "Điểm bắt đầu vuốt - Y", 0.40f),
         Field("wlen", "Độ dài vuốt (theo chiều rộng)", 0.10f),
         // Màu trên radar (hue 0-360)
-        Field("allyHue", "Màu đội mình - hue (210 = xanh dương)", 210f),
-        Field("allyTol", "Dung sai hue đội mình", 50f),
-        Field("enemyHue", "Màu đối thủ - hue (8 = đỏ/cam)", 8f),
-        Field("enemyTol", "Dung sai hue đối thủ", 35f),
+        Field("allyHue", "Màu đội mình - hue (0 = đỏ)", 0f),
+        Field("allyTol", "Dung sai hue đội mình", 30f),
+        Field("enemyHue", "Màu đối thủ - hue (-1 = TỰ ĐỘNG: mọi màu khác đội mình)", -1f),
+        Field("enemyTol", "Dung sai hue đối thủ (chỉ dùng khi không để -1)", 35f),
+        Field("pitchHue", "Màu nền sân trên radar - hue (120 = xanh lá)", 120f),
+        Field("pitchTol", "Dung sai hue nền sân (bị bỏ qua)", 55f),
         Field("minSat", "Độ bão hòa tối thiểu (0-1)", 0.45f),
         Field("minVal", "Độ sáng tối thiểu (0-1)", 0.35f),
         // Chiến thuật
@@ -79,7 +81,7 @@ object Cfg {
         Field("thresh", "Ngưỡng nhận diện nút menu (nhỏ = chặt)", 14f)
     )
 
-    private fun p(c: Context) = c.getSharedPreferences("cfg2", Context.MODE_PRIVATE)
+    private fun p(c: Context) = c.getSharedPreferences("cfg3", Context.MODE_PRIVATE)
 
     fun get(c: Context, key: String): Float =
         p(c).getFloat(key, FIELDS.first { it.key == key }.def)
@@ -448,7 +450,7 @@ class MainActivity : Activity() {
         help.text = "\n3. Mở DLS (chế độ ngang, đang có trận). Thanh nổi: ≡ kéo, ▶ chạy/dừng, " +
             "📷 chụp màn hình rồi: kéo vòng quanh RADAR và bấm 'RADAR'; kéo quanh joystick và bấm 'Joystick'; " +
             "chạm/kéo quanh nút A, B, C, điểm vuốt rồi bấm đúng nút. 'Lưu: NÚT MENU' để dạy bot bấm nút menu. " +
-            "🔍 bật khung kiểm tra radar (cyan = đội mình, đỏ = đối thủ, vàng = bóng), M = chỉ bấm menu.\n\n" +
+            "🔍 bật khung kiểm tra radar (vòng cyan = đội mình, vòng đỏ = đối thủ, vòng vàng = bóng), M = chỉ bấm menu.\n\n" +
             "Các thông số (có thể sửa tay):\n"
         root.addView(help)
 

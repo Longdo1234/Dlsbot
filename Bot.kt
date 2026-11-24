@@ -69,8 +69,10 @@ fun segDist(p: P, a: P, b: P): Float {
 
 // ======================= RADAR =======================
 class Radar(val ball: P?, val allies: List<P>, val enemies: List<P>) {
-    val ok: Boolean get() = allies.size >= 4 && enemies.size >= 4
+    val ok: Boolean get() = allies.size >= 4 && (enemies.size >= 2 || ball != null)
 }
+
+class Blob(val p: P, val area: Int, val fill: Float)
 
 object RadarAnalyzer {
     private fun hueOf(r: Int, g: Int, b: Int, mx: Int, mn: Int): Float {
@@ -98,6 +100,8 @@ object RadarAnalyzer {
         val enemyTol = Cfg.get(c, "enemyTol")
         val minSat = Cfg.get(c, "minSat")
         val minVal = Cfg.get(c, "minVal")
+        val pitchHue = Cfg.get(c, "pitchHue")
+        val pitchTol = Cfg.get(c, "pitchTol")
         val n = w * h
         val cls = ByteArray(n)
         for (i in 0 until n) {
@@ -119,8 +123,10 @@ object RadarAnalyzer {
                 cls[i] = 3
             } else if (hueDist(hue, allyHue) <= allyTol) {
                 cls[i] = 1
-            } else if (hueDist(hue, enemyHue) <= enemyTol) {
-                cls[i] = 2
+            } else if (enemyHue >= 0f) {
+                if (hueDist(hue, enemyHue) <= enemyTol) cls[i] = 2
+            } else if (hueDist(hue, pitchHue) > pitchTol) {
+                cls[i] = 2 // TỰ ĐỘNG: mọi màu bão hòa khác đội mình và khác nền sân
             }
         }
 
@@ -129,8 +135,7 @@ object RadarAnalyzer {
         val stack = IntArray(n)
         val allies = ArrayList<P>()
         val enemies = ArrayList<P>()
-        var ball: P? = null
-        var ballScore = 0f
+        val brights = ArrayList<Blob>()
         for (s0 in 0 until n) {
             val kind = cls[s0].toInt()
             if (kind == 0) continue
@@ -171,10 +176,20 @@ object RadarAnalyzer {
                 allies.add(pt)
             } else if (kind == 2) {
                 enemies.add(pt)
-            } else if (fill > ballScore) {
-                ballScore = fill
-                ball = pt
+            } else {
+                brights.add(Blob(pt, area, fill))
             }
+        }
+        var ball: P? = null
+        if (brights.size >= 6) {
+            // Nhiều chấm trắng/vàng: có thể đối thủ mặc áo trắng/vàng. Coi chấm nhỏ nhất là bóng.
+            val sm = brights.minByOrNull { it.area }
+            if (sm != null) {
+                ball = sm.p
+                for (bb in brights) if (bb !== sm) enemies.add(bb.p)
+            }
+        } else {
+            ball = brights.maxByOrNull { it.fill }?.p
         }
         return Radar(ball, allies, enemies)
     }
@@ -410,23 +425,24 @@ class Tactics(private val c: Context, private val pump: Pump) {
         pump.joy(a, hold)
     }
 
-    /** Hai thủ môn nằm ở hai đầu sân: bên nào thủ môn là màu đối thủ thì đó là khung thành cần ghi. */
+    /**
+     * Thủ môn đội mình (áo đỏ) đứng sát biên khung thành nhà -> tấn công về phía ngược lại.
+     * Thủ môn đối phương = chấm đối thủ gần khung thành cần ghi nhất.
+     */
     private fun detectGoal(r: Radar) {
-        val all = ArrayList<Pair<P, Boolean>>()
-        for (a in r.allies) all.add(Pair(a, false))
-        for (e in r.enemies) all.add(Pair(e, true))
-        if (all.size < 6) return
-        val left = all.minByOrNull { it.first.x } ?: return
-        val right = all.maxByOrNull { it.first.x } ?: return
-        if (left.second != right.second) {
-            vote += if (right.second) 1 else -1
-            vote = vote.coerceIn(-15, 15)
-            if (vote >= 8) attackRight = true
-            if (vote <= -8) attackRight = false
+        if (r.allies.size < 4) return
+        var minX = PL
+        var maxX = 0f
+        for (a in r.allies) {
+            if (a.x < minX) minX = a.x
+            if (a.x > maxX) maxX = a.x
         }
+        vote += if (minX < PL - maxX) 1 else -1 // thủ môn nhà ở bên trái -> tấn công sang phải
+        vote = vote.coerceIn(-15, 15)
+        if (vote >= 8) attackRight = true
+        if (vote <= -8) attackRight = false
         goalX = if (attackRight) PL else 0f
-        val g = if (attackRight) right else left
-        enemyGk = if (g.second) g.first else null
+        enemyGk = r.enemies.filter { abs(it.x - goalX) < 12f }.minByOrNull { abs(it.x - goalX) }
     }
 
     fun update(r: Radar, now: Long) {
