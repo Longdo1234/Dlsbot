@@ -26,6 +26,7 @@ jobs:
           mv accessibility_config.xml app/src/main/res/xml/accessibility_config.xml
           mv strings.xml app/src/main/res/values/strings.xml
           mv Main.kt app/src/main/java/com/dlsbot/Main.kt
+          mv Bot.kt app/src/main/java/com/dlsbot/Bot.kt
 
       - name: Cai Android SDK 34
         run: |
