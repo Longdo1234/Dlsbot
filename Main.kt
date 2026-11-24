@@ -1,7 +1,5 @@
 package com.dlsbot
 
-import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
 import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
@@ -14,7 +12,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -31,46 +28,58 @@ import android.provider.Settings
 import android.text.InputType
 import android.util.DisplayMetrics
 import android.view.Display
-import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
-import android.view.WindowManager
-import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
 import android.widget.EditText
-import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
-import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
-// ======================= CẤU HÌNH =======================
+// ======================= CẤU HÌNH (sửa được trong app) =======================
 class Field(val key: String, val label: String, val def: Float)
 
 object Cfg {
     val FIELDS = listOf(
-        Field("jx", "Joystick - X (0-1, theo chiều rộng)", 0.14f),
-        Field("jy", "Joystick - Y (0-1, theo chiều cao)", 0.72f),
-        Field("jr", "Độ dài kéo joystick (theo chiều cao)", 0.10f),
-        Field("sx", "Nút SÚT - X", 0.88f),
-        Field("sy", "Nút SÚT - Y", 0.70f),
-        Field("px", "Nút CHUYỀN - X", 0.80f),
-        Field("py", "Nút CHUYỀN - Y", 0.82f),
-        Field("dir", "Hướng tấn công (1 = sang phải, -1 = sang trái)", 1f),
-        Field("shootEvery", "Giây giữa các lần sút", 6f),
-        Field("passEvery", "Giây giữa các lần chuyền", 3.5f),
-        Field("thresh", "Ngưỡng nhận diện nút (nhỏ = chặt, mặc định 14)", 14f)
+        // Vùng RADAR (minimap) - tỉ lệ 0..1 so với màn hình ngang. Nên đặt bằng nút RADAR trong 📷
+        Field("mmL", "RADAR trái (MINIMAP_LEFT)", 0.36f),
+        Field("mmT", "RADAR trên (MINIMAP_TOP)", 0.80f),
+        Field("mmR", "RADAR phải (MINIMAP_RIGHT)", 0.64f),
+        Field("mmB", "RADAR dưới (MINIMAP_BOTTOM)", 0.98f),
+        // Joystick
+        Field("jx", "Joystick X (JOY_X)", 0.14f),
+        Field("jy", "Joystick Y (JOY_Y)", 0.72f),
+        Field("jr", "Bán kính kéo (JOY_RADIUS, theo chiều cao)", 0.10f),
+        // Nút hành động
+        Field("ax", "Nút A - X", 0.88f),
+        Field("ay", "Nút A - Y", 0.70f),
+        Field("bx", "Nút B - X", 0.80f),
+        Field("by", "Nút B - Y", 0.82f),
+        Field("cx", "Nút C - X", 0.93f),
+        Field("cy", "Nút C - Y", 0.55f),
+        Field("wx", "Điểm bắt đầu vuốt - X", 0.75f),
+        Field("wy", "Điểm bắt đầu vuốt - Y", 0.40f),
+        Field("wlen", "Độ dài vuốt (theo chiều rộng)", 0.10f),
+        // Màu trên radar (hue 0-360)
+        Field("allyHue", "Màu đội mình - hue (210 = xanh dương)", 210f),
+        Field("allyTol", "Dung sai hue đội mình", 50f),
+        Field("enemyHue", "Màu đối thủ - hue (8 = đỏ/cam)", 8f),
+        Field("enemyTol", "Dung sai hue đối thủ", 35f),
+        Field("minSat", "Độ bão hòa tối thiểu (0-1)", 0.45f),
+        Field("minVal", "Độ sáng tối thiểu (0-1)", 0.35f),
+        // Chiến thuật
+        Field("carryFrac", "Ngưỡng giữ bóng (tỉ lệ chiều rộng radar)", 0.02f),
+        Field("danger", "Bán kính nguy hiểm khi bị áp sát (mét)", 7f),
+        Field("dir", "Hướng tấn công ban đầu (1 = phải, -1 = trái)", 1f),
+        Field("thresh", "Ngưỡng nhận diện nút menu (nhỏ = chặt)", 14f)
     )
 
-    private fun p(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+    private fun p(c: Context) = c.getSharedPreferences("cfg2", Context.MODE_PRIVATE)
 
     fun get(c: Context, key: String): Float =
         p(c).getFloat(key, FIELDS.first { it.key == key }.def)
@@ -80,13 +89,14 @@ object Cfg {
     }
 }
 
-// ======================= NHẬN DIỆN =======================
+// ======================= NHẬN DIỆN NÚT MENU =======================
 class Gray(val w: Int, val h: Int, val d: ByteArray)
 class Hit(val x: Int, val y: Int, val mad: Float)
 class Template(val name: String, val ingame: Boolean, val gray: Gray)
+class Roi(val px: IntArray, val w: Int, val h: Int, val fresh: Boolean)
 
 object Vision {
-    const val S = 4 // hệ số thu nhỏ khi so khớp
+    const val S = 4
 
     fun gray(px: IntArray, W: Int, H: Int): Gray {
         val w = W / S
@@ -108,7 +118,6 @@ object Vision {
         return Gray(w, h, out)
     }
 
-    /** So khớp mẫu bằng sai khác tuyệt đối trung bình (MAD), càng nhỏ càng giống. */
     fun match(f: Gray, t: Gray): Hit? {
         if (t.w < 2 || t.h < 2 || t.w > f.w || t.h > f.h) return null
         val fd = f.d
@@ -140,76 +149,8 @@ object Vision {
         }
         return if (bx < 0) null else Hit(bx, by, best.toFloat() / (t.w * t.h))
     }
-
-    /** Tìm quả bóng: cụm điểm trắng nhỏ, gần tròn. Trả về [x, y] theo pixel gốc. */
-    fun findBall(px: IntArray, W: Int, H: Int): FloatArray? {
-        val s = 2
-        val w = W / s
-        val h = H / s
-        val mask = BooleanArray(w * h)
-        val x0 = (w * 0.2f).toInt()
-        val x1 = (w * 0.85f).toInt()
-        val y0 = (h * 0.12f).toInt()
-        val y1 = (h * 0.9f).toInt()
-        for (y in y0 until y1) {
-            for (x in x0 until x1) {
-                val p = px[y * s * W + x * s]
-                val r = (p shr 16) and 255
-                val g = (p shr 8) and 255
-                val b = p and 255
-                val mn = min(r, min(g, b))
-                val mx = max(r, max(g, b))
-                mask[y * w + x] = mn > 200 && (mx - mn) < 35
-            }
-        }
-        val stack = IntArray(w * h)
-        var best: FloatArray? = null
-        var bestScore = 0.6f
-        for (start in 0 until w * h) {
-            if (!mask[start]) continue
-            var sp = 0
-            stack[sp++] = start
-            mask[start] = false
-            var area = 0
-            var sx = 0L
-            var sy = 0L
-            var minX = w
-            var maxX = 0
-            var minY = h
-            var maxY = 0
-            while (sp > 0) {
-                val c = stack[--sp]
-                val cx = c % w
-                val cy = c / w
-                area++
-                sx += cx
-                sy += cy
-                if (cx < minX) minX = cx
-                if (cx > maxX) maxX = cx
-                if (cy < minY) minY = cy
-                if (cy > maxY) maxY = cy
-                if (cx > 0 && mask[c - 1]) { mask[c - 1] = false; stack[sp++] = c - 1 }
-                if (cx < w - 1 && mask[c + 1]) { mask[c + 1] = false; stack[sp++] = c + 1 }
-                if (cy > 0 && mask[c - w]) { mask[c - w] = false; stack[sp++] = c - w }
-                if (cy < h - 1 && mask[c + w]) { mask[c + w] = false; stack[sp++] = c + w }
-            }
-            if (area < 12 || area > 400) continue
-            val bw = maxX - minX + 1
-            val bh = maxY - minY + 1
-            val asp = bw.toFloat() / bh
-            val fill = area.toFloat() / (bw * bh)
-            if (asp < 0.6f || asp > 1.7f || fill < 0.55f) continue
-            val score = 1f - abs(fill - 0.785f)
-            if (score > bestScore) {
-                bestScore = score
-                best = floatArrayOf((sx.toFloat() / area + 0.5f) * s, (sy.toFloat() / area + 0.5f) * s)
-            }
-        }
-        return best
-    }
 }
 
-// ======================= LƯU TEMPLATE =======================
 object Store {
     fun dir(c: Context): File = File(c.filesDir, "templates").also { it.mkdirs() }
 
@@ -233,7 +174,6 @@ object Store {
         return out
     }
 
-    /** f = [x1, y1, x2, y2] theo tỉ lệ 0..1. Căn lề theo bội số của S để khớp phase khi so mẫu. */
     fun save(c: Context, bmp: Bitmap, f: FloatArray, ingame: Boolean): Boolean {
         val s = Vision.S
         var x0 = (min(f[0], f[2]) * bmp.width).toInt() / s * s
@@ -262,10 +202,14 @@ class CaptureService : Service() {
     private var mp: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var w = 0
-    private var h = 0
+    var w = 0
+        private set
+    var h = 0
+        private set
     private var dpi = 0
     private var last: Bitmap? = null
+    private var lastRoi: Roi? = null
+    private var lastRoiKey = ""
     private var released = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -322,7 +266,6 @@ class CaptureService : Service() {
         dpi = dm.densityDpi
     }
 
-    /** Khi xoay màn hình (dọc -> ngang), tạo lại vùng đệm cho đúng kích thước. */
     private fun ensureSize() {
         val ow = w
         val oh = h
@@ -334,10 +277,11 @@ class CaptureService : Service() {
             vd?.resize(w, h, dpi)
             vd?.surface = rd.surface
             last = null
+            lastRoi = null
         }
     }
 
-    /** Lấy khung hình mới nhất (hoặc khung cũ nếu màn hình không đổi). */
+    /** Khung hình đầy đủ (dùng cho menu và chụp template). */
     @Synchronized
     fun grab(): Bitmap? {
         ensureSize()
@@ -364,6 +308,53 @@ class CaptureService : Service() {
         return last
     }
 
+    /** Chỉ đọc vùng RADAR từ bộ đệm ảnh (nhanh, dùng cho vòng lặp 15-20 FPS). */
+    @Synchronized
+    fun grabRoi(f0: Float, f1: Float, f2: Float, f3: Float): Roi? {
+        ensureSize()
+        val key = "$w,$h,$f0,$f1,$f2,$f3"
+        val img = try {
+            reader?.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        }
+        if (img == null) {
+            val lr = lastRoi
+            return if (lr != null && key == lastRoiKey) Roi(lr.px, lr.w, lr.h, false) else null
+        }
+        try {
+            val iw = img.width
+            val ih = img.height
+            val x0 = (min(f0, f2) * iw).toInt().coerceIn(0, iw - 2)
+            val x1 = (max(f0, f2) * iw).toInt().coerceIn(x0 + 1, iw)
+            val y0 = (min(f1, f3) * ih).toInt().coerceIn(0, ih - 2)
+            val y1 = (max(f1, f3) * ih).toInt().coerceIn(y0 + 1, ih)
+            val rw = x1 - x0
+            val rh = y1 - y0
+            val p = img.planes[0]
+            val buf = p.buffer
+            val rs = p.rowStride
+            val ps = p.pixelStride
+            val out = IntArray(rw * rh)
+            for (yy in 0 until rh) {
+                var off = (y0 + yy) * rs + x0 * ps
+                for (xx in 0 until rw) {
+                    val r = buf.get(off).toInt() and 255
+                    val g = buf.get(off + 1).toInt() and 255
+                    val b = buf.get(off + 2).toInt() and 255
+                    out[yy * rw + xx] = (255 shl 24) or (r shl 16) or (g shl 8) or b
+                    off += ps
+                }
+            }
+            val roi = Roi(out, rw, rh, true)
+            lastRoi = roi
+            lastRoiKey = key
+            return roi
+        } finally {
+            img.close()
+        }
+    }
+
     private fun release() {
         if (released) return
         released = true
@@ -380,7 +371,7 @@ class CaptureService : Service() {
     }
 }
 
-// ======================= VÙNG CHỌN TEMPLATE =======================
+// ======================= VÙNG CHỌN TRÊN ẢNH CHỤP =======================
 class SelectView(c: Context) : View(c) {
     private var x0 = 0f
     private var y0 = 0f
@@ -412,322 +403,6 @@ class SelectView(c: Context) : View(c) {
             (min(x0, x1) / width).coerceIn(0f, 1f), (min(y0, y1) / height).coerceIn(0f, 1f),
             (max(x0, x1) / width).coerceIn(0f, 1f), (max(y0, y1) / height).coerceIn(0f, 1f)
         )
-    }
-}
-
-// ======================= BOT (TRỢ NĂNG + THANH NỔI) =======================
-class BotService : AccessibilityService() {
-    companion object {
-        @Volatile
-        var instance: BotService? = null
-    }
-
-    private val ui = Handler(Looper.getMainLooper())
-    private lateinit var wm: WindowManager
-    private var panel: LinearLayout? = null
-    private var runBtn: TextView? = null
-    private var menuBtn: TextView? = null
-    private var editor: FrameLayout? = null
-    @Volatile private var running = false
-    @Volatile private var menuOnly = false
-    private var lastShoot = 0L
-    private var lastPass = 0L
-
-    override fun onServiceConnected() {
-        instance = this
-        wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        buildPanel()
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
-    override fun onInterrupt() {}
-
-    override fun onUnbind(intent: Intent?): Boolean {
-        running = false
-        panel?.let { try { wm.removeView(it) } catch (e: Exception) { } }
-        editor?.let { try { wm.removeView(it) } catch (e: Exception) { } }
-        instance = null
-        return super.onUnbind(intent)
-    }
-
-    private fun toast(m: String) {
-        ui.post { Toast.makeText(this, m, Toast.LENGTH_SHORT).show() }
-    }
-
-    private fun tv(t: String, a: () -> Unit): TextView = TextView(this).apply {
-        text = t
-        textSize = 20f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER
-        setPadding(28, 18, 28, 18)
-        setOnClickListener { a() }
-    }
-
-    private fun btn(t: String, a: () -> Unit): Button {
-        val b = Button(this)
-        b.text = t
-        b.setOnClickListener { a() }
-        return b
-    }
-
-    private fun buildPanel() {
-        val col = LinearLayout(this)
-        col.orientation = LinearLayout.VERTICAL
-        col.setBackgroundColor(0x99000000.toInt())
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        )
-        lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = 0
-        lp.y = 250
-
-        val handle = tv("≡") {}
-        var dx = 0f
-        var dy = 0f
-        var ox = 0
-        var oy = 0
-        handle.setOnTouchListener { _, e ->
-            when (e.action) {
-                MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; ox = lp.x; oy = lp.y }
-                MotionEvent.ACTION_MOVE -> {
-                    lp.x = ox + (e.rawX - dx).toInt()
-                    lp.y = oy + (e.rawY - dy).toInt()
-                    wm.updateViewLayout(col, lp)
-                }
-            }
-            true
-        }
-        val run = tv("▶") { if (running) stopBot() else startBot() }
-        val snap = tv("📷") { openEditor() }
-        val menu = tv("M") {
-            menuOnly = !menuOnly
-            menuBtn?.setTextColor(if (menuOnly) Color.YELLOW else Color.WHITE)
-            toast(if (menuOnly) "Chỉ tự bấm menu: BẬT" else "Chỉ tự bấm menu: TẮT")
-        }
-        runBtn = run
-        menuBtn = menu
-        col.addView(handle)
-        col.addView(run)
-        col.addView(snap)
-        col.addView(menu)
-        wm.addView(col, lp)
-        panel = col
-    }
-
-    // ---------- Tạo template: chụp màn hình, kéo chọn vùng ----------
-    private fun openEditor() {
-        val cap = CaptureService.instance
-        if (cap == null) {
-            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Bật quét màn hình'")
-            return
-        }
-        if (editor != null) return
-        panel?.visibility = View.INVISIBLE
-        ui.postDelayed({
-            Thread {
-                val bmp = cap.grab()
-                ui.post {
-                    panel?.visibility = View.VISIBLE
-                    if (bmp == null) toast("Không chụp được màn hình") else showEditor(bmp)
-                }
-            }.start()
-        }, 450)
-    }
-
-    private fun showEditor(bmp: Bitmap) {
-        val root = FrameLayout(this)
-        val iv = ImageView(this)
-        iv.setImageBitmap(bmp)
-        iv.scaleType = ImageView.ScaleType.FIT_XY
-        val sel = SelectView(this)
-        root.addView(iv, FrameLayout.LayoutParams(-1, -1))
-        root.addView(sel, FrameLayout.LayoutParams(-1, -1))
-
-        val hint = TextView(this)
-        hint.text = "Kéo ngón tay quanh nút/biểu tượng cần nhận diện (chọn vùng có chữ hoặc hình rõ)"
-        hint.setTextColor(Color.YELLOW)
-        hint.setBackgroundColor(0xAA000000.toInt())
-        hint.setPadding(20, 12, 20, 12)
-        root.addView(hint, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
-
-        fun close() {
-            editor?.let { try { wm.removeView(it) } catch (e: Exception) { } }
-            editor = null
-        }
-
-        fun save(ingame: Boolean) {
-            val f = sel.fractions()
-            if (f == null || !Store.save(this, bmp, f, ingame)) {
-                toast("Chưa chọn vùng hợp lệ")
-            } else {
-                toast("Đã lưu template")
-                close()
-            }
-        }
-
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER
-        bar.setBackgroundColor(0xAA000000.toInt())
-        bar.addView(btn("Lưu: NÚT BẤM") { save(false) })
-        bar.addView(btn("Lưu: TRONG TRẬN") { save(true) })
-        bar.addView(btn("Hủy") { close() })
-        root.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-
-        val lp = WindowManager.LayoutParams(
-            -1, -1,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        )
-        wm.addView(root, lp)
-        editor = root
-    }
-
-    // ---------- Chạy / dừng ----------
-    private fun startBot() {
-        if (running) return
-        if (CaptureService.instance == null) {
-            toast("Chưa bật quét màn hình. Mở app DLS Bot và bấm 'Bật quét màn hình'")
-            return
-        }
-        running = true
-        runBtn?.text = "■"
-        Thread { loop() }.apply { isDaemon = true }.start()
-    }
-
-    private fun stopBot() {
-        running = false
-        runBtn?.text = "▶"
-    }
-
-    private fun dispatch(strokes: List<GestureDescription.StrokeDescription>): Boolean {
-        val b = GestureDescription.Builder()
-        for (s in strokes) b.addStroke(s)
-        val latch = CountDownLatch(1)
-        var ok = false
-        val cb = object : AccessibilityService.GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) {
-                ok = true
-                latch.countDown()
-            }
-
-            override fun onCancelled(g: GestureDescription?) {
-                latch.countDown()
-            }
-        }
-        if (!dispatchGesture(b.build(), cb, null)) return false
-        latch.await(3, TimeUnit.SECONDS)
-        return ok
-    }
-
-    private fun tapStroke(x: Float, y: Float, start: Long, dur: Long): GestureDescription.StrokeDescription {
-        val p = Path()
-        p.moveTo(x, y)
-        return GestureDescription.StrokeDescription(p, start, dur)
-    }
-
-    private fun loop() {
-        val templates = Store.load(this)
-        toast("Bot chạy với ${templates.size} template")
-        val thresh = Cfg.get(this, "thresh")
-        val hasIngame = templates.any { it.ingame }
-        while (running) {
-            try {
-                val bmp = CaptureService.instance?.grab()
-                if (bmp == null) {
-                    Thread.sleep(300)
-                    continue
-                }
-                val W = bmp.width
-                val H = bmp.height
-                val px = IntArray(W * H)
-                bmp.getPixels(px, 0, W, 0, 0, W, H)
-                val g = Vision.gray(px, W, H)
-
-                var bestHit: Hit? = null
-                var bestT: Template? = null
-                var inGame = false
-                for (t in templates) {
-                    val hit = Vision.match(g, t.gray) ?: continue
-                    if (hit.mad > thresh) continue
-                    if (t.ingame) {
-                        inGame = true
-                    } else if (bestHit == null || hit.mad < bestHit.mad) {
-                        bestHit = hit
-                        bestT = t
-                    }
-                }
-                val bh = bestHit
-                val bt = bestT
-                if (bh != null && bt != null) {
-                    val tx = bh.x * Vision.S + bt.gray.w * Vision.S / 2
-                    val ty = bh.y * Vision.S + bt.gray.h * Vision.S / 2
-                    dispatch(listOf(tapStroke(tx.toFloat(), ty.toFloat(), 0, 60)))
-                    Thread.sleep(1000)
-                    continue
-                }
-                if (menuOnly) {
-                    Thread.sleep(500)
-                    continue
-                }
-                if (hasIngame && !inGame) {
-                    Thread.sleep(400)
-                    continue
-                }
-                play(px, W, H)
-            } catch (e: Exception) {
-                try { Thread.sleep(500) } catch (x: Exception) { }
-            }
-        }
-        ui.post { runBtn?.text = "▶" }
-    }
-
-    private fun play(px: IntArray, W: Int, H: Int) {
-        val jx = Cfg.get(this, "jx") * W
-        val jy = Cfg.get(this, "jy") * H
-        val r = Cfg.get(this, "jr") * H
-        var dx = Cfg.get(this, "dir")
-        var dy = 0f
-        var hasBall = true
-        val ball = Vision.findBall(px, W, H)
-        if (ball != null) {
-            val vx = ball[0] - W / 2f
-            val vy = ball[1] - H / 2f
-            val d = hypot(vx, vy)
-            if (d > H * 0.12f) {
-                dx = vx / d
-                dy = vy / d
-                hasBall = false // bóng ở xa -> chạy tới bóng
-            }
-        }
-        val n = hypot(dx, dy)
-        if (n > 0f) {
-            dx /= n
-            dy /= n
-        }
-        val path = Path()
-        path.moveTo(jx, jy)
-        path.lineTo(jx + dx * r, jy + dy * r)
-        val strokes = ArrayList<GestureDescription.StrokeDescription>()
-        strokes.add(GestureDescription.StrokeDescription(path, 0, 450))
-        val now = System.currentTimeMillis()
-        val shootGap = (Cfg.get(this, "shootEvery") * 1000).toLong()
-        val passGap = (Cfg.get(this, "passEvery") * 1000).toLong()
-        // Một gesture có thể có nhiều nét cùng lúc: vừa giữ joystick vừa bấm nút
-        if (hasBall && now - lastShoot > shootGap) {
-            strokes.add(tapStroke(Cfg.get(this, "sx") * W, Cfg.get(this, "sy") * H, 150, 60))
-            lastShoot = now
-        } else if (hasBall && now - lastPass > passGap) {
-            strokes.add(tapStroke(Cfg.get(this, "px") * W, Cfg.get(this, "py") * H, 150, 60))
-            lastPass = now
-        }
-        dispatch(strokes)
     }
 }
 
@@ -766,14 +441,15 @@ class MainActivity : Activity() {
         }
         add("2. Bật quét màn hình") {
             val m = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            @Suppress("DEPRECATION")
             startActivityForResult(m.createScreenCaptureIntent(), 100)
         }
 
         val help = TextView(this)
-        help.text = "\n3. Mở DLS (chế độ ngang). Thanh nổi: ≡ kéo di chuyển, ▶ chạy/dừng, " +
-            "📷 tạo template (nút bấm hoặc dấu hiệu đang trong trận), M chỉ bấm menu.\n\n" +
-            "Cấu hình toạ độ (tỉ lệ 0-1 so với màn hình ngang):\n"
+        help.text = "\n3. Mở DLS (chế độ ngang, đang có trận). Thanh nổi: ≡ kéo, ▶ chạy/dừng, " +
+            "📷 chụp màn hình rồi: kéo vòng quanh RADAR và bấm 'RADAR'; kéo quanh joystick và bấm 'Joystick'; " +
+            "chạm/kéo quanh nút A, B, C, điểm vuốt rồi bấm đúng nút. 'Lưu: NÚT MENU' để dạy bot bấm nút menu. " +
+            "🔍 bật khung kiểm tra radar (cyan = đội mình, đỏ = đối thủ, vàng = bóng), M = chỉ bấm menu.\n\n" +
+            "Các thông số (có thể sửa tay):\n"
         root.addView(help)
 
         for (f in Cfg.FIELDS) {
@@ -793,7 +469,10 @@ class MainActivity : Activity() {
             }
             Toast.makeText(this, "Đã lưu cấu hình", Toast.LENGTH_SHORT).show()
         }
-        add("Xóa toàn bộ template") {
+        add("Cập nhật ô nhập từ giá trị đã đặt bằng 📷") {
+            for (f in Cfg.FIELDS) inputs[f.key]?.setText(Cfg.get(this, f.key).toString())
+        }
+        add("Xóa toàn bộ template menu") {
             Store.clear(this)
             refresh()
         }
@@ -826,6 +505,6 @@ class MainActivity : Activity() {
         val cap = CaptureService.instance != null
         status.text = "Trợ năng: " + (if (enabled) "ĐÃ BẬT ✅" else "chưa bật ❌") +
             "\nQuét màn hình: " + (if (cap) "ĐANG CHẠY ✅" else "chưa bật ❌") +
-            "\nTemplate đã lưu: " + Store.count(this)
+            "\nTemplate menu đã lưu: " + Store.count(this)
     }
 }
