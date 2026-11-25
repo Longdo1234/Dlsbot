@@ -69,6 +69,14 @@ object Cfg {
         // Chiến thuật
         Field("carryFrac", "Giữ bóng", 0.02f), Field("danger", "Nguy hiểm (m)", 7f),
         Field("dir", "1 = phải", 1f),
+        Field("dirMode", "0=tự động 1=→ -1=←", 0f),
+        Field("aimMs", "Chờ ngắm (ms)", 220f),
+        Field("shotMaxD", "Sút tối đa (m)", 28f),
+        Field("shotQ", "Ngưỡng sút", 0.07f),
+        Field("orient", "Trục 0-3", 0f),
+        Field("learn", "Tự học 1/0", 1f),
+        Field("pScale", "Hệ số sệt", 1f),
+        Field("lScale", "Hệ số bổng", 1f),
         Field("dead", "Vùng chết °", 12f), Field("turn", "Xoay °/s", 200f), Field("evade", "Né °/s", 600f),
         Field("thresh", "Ngưỡng", 14f),
         // Lực (ms giữ phím)
@@ -96,7 +104,10 @@ object Cfg {
         )),
         Tab("Chiến thuật", listOf(
             Row("Bóng / áp sát", listOf("carryFrac", "danger")),
-            Row("Hướng tấn công", listOf("dir")),
+            Row("Hướng tấn công", listOf("dirMode")),
+            Row("Ngắm / sút xa", listOf("aimMs", "shotMaxD")),
+            Row("Chất lượng sút", listOf("shotQ")),
+            Row("Trục joystick (tự học)", listOf("orient", "learn")),
             Row("Rê bóng", listOf("dead", "turn", "evade")),
             Row("Nút menu", listOf("thresh"))
         )),
@@ -104,7 +115,8 @@ object Cfg {
             Row("Chuyền sệt B", listOf("passBase", "passPerM", "passMax")),
             Row("Chuyền bổng L", listOf("lobBase", "lobPerM", "lobMax")),
             Row("Sút A", listOf("shotNear", "shotFar")),
-            Row("Sút sệt B", listOf("gsBase", "gsPerM", "gsMax"))
+            Row("Sút sệt B", listOf("gsBase", "gsPerM", "gsMax")),
+            Row("Hệ số lực (tự học)", listOf("pScale", "lScale"))
         ))
     )
 
